@@ -1072,3 +1072,529 @@ The resulting design is:
 The network policy provides the actual guarantee.
 
 The per-device policy keeps the GUI tidy.
+
+---
+
+## Addendum: Runtime Reconciliation and Reboot Persistence
+
+### Why `reconcile` Was Added
+
+Firewalla stores DNS Booster configuration persistently in Redis, but the runtime enforcement ipsets are rebuilt as Firewalla services start and devices become active.
+
+This creates an important distinction between:
+
+```text
+Persistent policy
+```
+
+and:
+
+```text
+Current runtime ipset state
+```
+
+For example, all known devices may have:
+
+```json
+{"dnsCaching":false}
+```
+
+stored under their individual `policy:mac:<MAC>` Redis keys, while only currently active devices are present in:
+
+```text
+no_dns_caching_mac_set
+```
+
+During testing, there were:
+
+```text
+Known devices:                       86
+Explicitly OFF / unchecked:         86
+Currently in bypass IPset:           58
+```
+
+The remaining devices were correctly configured in Redis but were not currently represented in the live MAC bypass ipset.
+
+To provide true **belt-and-suspenders enforcement**, the utility now includes:
+
+```bash
+dnsbooster reconcile
+```
+
+---
+
+## What `reconcile` Does
+
+`reconcile` treats Firewalla's persistent Redis policies as the source of truth.
+
+It does **not modify policy values**.
+
+Instead, it examines the stored configuration and makes the runtime DNS Booster ipsets agree with it.
+
+Conceptually:
+
+```text
+              Persistent Redis Policy
+                       |
+          +------------+------------+
+          |                         |
+   policy:network:*            policy:mac:*
+          |                         |
+          v                         v
+  Network DNS Booster       Device DNS Booster
+       preference                preference
+          |                         |
+          +------------+------------+
+                       |
+                       v
+               dnsbooster reconcile
+                       |
+          +------------+------------+
+          |                         |
+ no_dns_caching_set     no_dns_caching_mac_set
+```
+
+This preserves the distinction between the different operating modes.
+
+---
+
+## Operating Modes Survive Reboot
+
+The utility does not store its own separate mode such as:
+
+```text
+MODE=all-off
+```
+
+Instead, the actual Firewalla policies determine what should happen after restart.
+
+### Device-Only Disable
+
+If you run:
+
+```bash
+dnsbooster gui-off
+```
+
+while leaving the network policy enabled or unset, the persistent state is approximately:
+
+```text
+Network: DNS Booster ON/default
+Devices: DNS Booster OFF
+```
+
+After reboot:
+
+```bash
+dnsbooster reconcile
+```
+
+restores all explicitly disabled MAC addresses to:
+
+```text
+no_dns_caching_mac_set
+```
+
+but does **not** disable DNS Booster network-wide.
+
+---
+
+### Network-Only Disable
+
+If you run:
+
+```bash
+dnsbooster net-off br0
+```
+
+without explicitly disabling every device, the persistent state is:
+
+```text
+br0:     DNS Booster OFF
+Devices: individual policies unchanged
+```
+
+After reboot, `reconcile` restores the network's Firewalla ipsets into:
+
+```text
+no_dns_caching_set
+```
+
+but does not invent or change individual device policies.
+
+New devices on that network continue to bypass DNS Booster because the network itself is excluded.
+
+---
+
+### Full Disable
+
+Running:
+
+```bash
+dnsbooster all-off br0
+```
+
+creates both:
+
+```text
+Network policy: DNS Booster OFF
+Device policies: DNS Booster OFF
+```
+
+and immediately reconciles the known MAC addresses into the live bypass ipset.
+
+This provides:
+
+```text
+Network-wide bypass
+        +
+Persistent per-device OFF policies
+        +
+Every known MAC in the live bypass ipset
+```
+
+After reboot, `reconcile` rebuilds the same runtime state from Redis.
+
+---
+
+## Belt-and-Suspenders Device Enforcement
+
+The updated `gui-off` / `devices-off` behavior does more than store the Firewalla policy.
+
+For every known device it now:
+
+1. Ensures the persistent Redis policy has:
+
+```json
+{"dnsCaching":false}
+```
+
+2. Publishes Firewalla's normal:
+
+```text
+Host:PolicyChanged
+```
+
+event when the persistent policy actually changes.
+
+3. Ensures the MAC is directly present in:
+
+```text
+no_dns_caching_mac_set
+```
+
+even if Firewalla currently considers the device offline or stale.
+
+This means a successful run should result in matching counts.
+
+Example:
+
+```text
+Devices: DNS Booster OFF / unchecked
+  Known devices:       86
+  Redis changed:       0
+  Redis already set:   86
+  Skipped:             0
+  Added to live ipset: 28
+  Already in ipset:    58
+```
+
+Afterward:
+
+```bash
+dnsbooster status br0
+```
+
+should show:
+
+```text
+Devices
+  Known:                       86
+  Explicitly OFF / unchecked: 86
+  Explicitly ON / checked:     0
+  Unset (default ON):          0
+  Invalid policy JSON:         0
+  Currently in bypass IPset:   86
+```
+
+The raw ipset can also be checked with:
+
+```bash
+ipset list no_dns_caching_mac_set |
+    grep 'Number of entries'
+```
+
+Example:
+
+```text
+Number of entries: 86
+```
+
+---
+
+## Reconcile Command
+
+Run manually at any time with:
+
+```bash
+dnsbooster reconcile
+```
+
+This is safe to run repeatedly.
+
+It does not change the chosen DNS Booster configuration.
+
+Its job is simply:
+
+```text
+Stored policy
+     ↓
+Live enforcement
+```
+
+Typical reasons to run it manually include:
+
+- after troubleshooting Firewalla services
+- after manually inspecting or modifying ipsets
+- after a Firewalla software update
+- after restarting policy-related services
+- when persistent policy and runtime ipset counts appear inconsistent
+
+---
+
+## Updated Startup Helper
+
+The startup helper:
+
+```text
+/home/pi/.firewalla/config/post_main.d/10-dnsbooster-command.sh
+```
+
+now performs two jobs.
+
+### 1. Restore the Command Symlink
+
+It ensures:
+
+```text
+/usr/local/bin/dnsbooster
+```
+
+points to:
+
+```text
+/home/pi/.firewalla/config/dnsbooster
+```
+
+This is useful in case a Firewalla software update removes files or symlinks under `/usr/local/bin`.
+
+### 2. Reconcile Runtime DNS Booster State
+
+After Firewalla starts, it runs:
+
+```bash
+/home/pi/.firewalla/config/dnsbooster reconcile
+```
+
+This rebuilds the runtime DNS Booster bypass state according to the persistent Redis policies.
+
+The startup helper does **not** blindly run:
+
+```bash
+dnsbooster all-off
+```
+
+or:
+
+```bash
+dnsbooster gui-off
+```
+
+That is intentional.
+
+Doing so would destroy the distinction between device-only and network-only configurations.
+
+Instead:
+
+```text
+Redis remembers what was chosen.
+reconcile restores what Redis says.
+```
+
+---
+
+## Startup Logging
+
+Automatic reconciliation output is written to:
+
+```text
+/home/pi/.firewalla/config/dnsbooster-reconcile.log
+```
+
+Check the latest startup reconciliation with:
+
+```bash
+tail -100 \
+    /home/pi/.firewalla/config/dnsbooster-reconcile.log
+```
+
+A successful run should end with output indicating that the runtime ipsets were reconciled successfully.
+
+---
+
+## Test the Startup Helper Manually
+
+A reboot is not required to test the startup behavior.
+
+Run:
+
+```bash
+sudo \
+    /home/pi/.firewalla/config/post_main.d/10-dnsbooster-command.sh
+```
+
+Then inspect:
+
+```bash
+tail -100 \
+    /home/pi/.firewalla/config/dnsbooster-reconcile.log
+```
+
+Verify the final state with:
+
+```bash
+dnsbooster status
+```
+
+or:
+
+```bash
+dnsbooster status br0
+```
+
+---
+
+## Recommended Verification After Reboot
+
+After rebooting Firewalla:
+
+```bash
+dnsbooster status br0
+```
+
+For a fully disabled configuration, verify:
+
+```text
+Stored policy:             OFF
+Network bypass IPset:      YES
+```
+
+and:
+
+```text
+Explicitly OFF / unchecked: <all known devices>
+Currently in bypass IPset:   <all known devices>
+```
+
+Also verify directly:
+
+```bash
+ipset list no_dns_caching_set
+```
+
+and:
+
+```bash
+ipset list no_dns_caching_mac_set |
+    grep 'Number of entries'
+```
+
+---
+
+## Current Command Summary
+
+```text
+dnsbooster status [interface]
+
+dnsbooster net-off <interface>
+dnsbooster net-on <interface>
+
+dnsbooster devices-off
+dnsbooster devices-on
+
+dnsbooster gui-off
+dnsbooster gui-on
+
+dnsbooster all-off <interface>
+dnsbooster all-on <interface>
+
+dnsbooster reconcile
+```
+
+### `net-off`
+
+Persistent network-level DNS Booster disable.
+
+Covers current and future devices on that Firewalla network.
+
+### `gui-off` / `devices-off`
+
+Persistent per-device disable for every currently known device and immediate reconciliation into the live MAC bypass ipset.
+
+### `all-off`
+
+Combines network-wide and per-device disable.
+
+This is the strongest configuration.
+
+### `reconcile`
+
+Makes runtime ipsets match the existing persistent policies without changing those policies.
+
+---
+
+## Final Persistence Model
+
+The completed design is:
+
+```text
+                    FIREWALLA REDIS
+                         |
+          +--------------+--------------+
+          |                             |
+   Network policy                 Device policies
+   dnsCaching=false               dnsCaching=false
+          |                             |
+          |                             |
+          +--------------+--------------+
+                         |
+                  Persistent across
+                       reboot
+                         |
+                         v
+             10-dnsbooster-command.sh
+                         |
+                         v
+                dnsbooster reconcile
+                         |
+          +--------------+--------------+
+          |                             |
+ no_dns_caching_set        no_dns_caching_mac_set
+          |                             |
+          +--------------+--------------+
+                         |
+                         v
+              Runtime DNS enforcement
+```
+
+This provides three independent layers:
+
+```text
+Persistent Firewalla network policy
+             +
+Persistent Firewalla device policies
+             +
+Explicit runtime ipset reconciliation
+```
+
+The selected configuration survives reboot without the startup process having to guess whether the intended mode was network-only, device-only, or both.
