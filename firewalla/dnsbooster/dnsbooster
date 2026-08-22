@@ -23,6 +23,7 @@ usage() {
     cat <<'USAGE'
 Usage:
   dnsbooster status [interface]
+  dnsbooster reconcile
 
   dnsbooster net-off <interface>
   dnsbooster net-on <interface>
@@ -39,6 +40,7 @@ Usage:
 Examples:
   dnsbooster status
   dnsbooster status br0
+  dnsbooster reconcile
 
   dnsbooster net-off br0
   dnsbooster net-on br0
@@ -236,6 +238,170 @@ set_devices() {
     fi
 }
 
+wait_for_runtime() {
+    local max_attempts="${1:-30}"
+    local attempt
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        if [[ "$($REDIS --raw PING 2>/dev/null)" == "PONG" ]] && \
+           ipset list no_dns_caching_set >/dev/null 2>&1 && \
+           ipset list no_dns_caching_mac_set >/dev/null 2>&1; then
+            return 0
+        fi
+
+        sleep 2
+    done
+
+    echo "ERROR: Firewalla DNS Booster ipsets were not ready after $((max_attempts * 2)) seconds." >&2
+    return 1
+}
+
+reconcile_networks() {
+    local key type intf uuid raw desired prefix member
+    local total=0 off=0 on=0 unset=0 invalid=0
+    local added=0 removed=0 already=0 missing=0
+
+    while IFS= read -r key; do
+        type=$($REDIS --raw HGET "$key" type)
+        [[ "$type" == "lan" ]] || continue
+
+        total=$((total + 1))
+        intf=$($REDIS --raw HGET "$key" intf)
+        uuid="${key#network:uuid:}"
+        raw=$($REDIS --raw HGET "policy:network:$uuid" dnsmasq)
+
+        if [[ -z "$raw" ]]; then
+            # No network-level dnsmasq policy means Firewalla default: Booster ON.
+            desired="true"
+            unset=$((unset + 1))
+        elif ! jq -e . >/dev/null 2>&1 <<<"$raw"; then
+            echo "WARNING: $intf ($uuid) has invalid network dnsmasq JSON; skipped: $raw" >&2
+            invalid=$((invalid + 1))
+            continue
+        elif [[ "$(jq -r '.dnsCaching == true' <<<"$raw")" == "true" ]]; then
+            desired="true"
+            on=$((on + 1))
+        else
+            # Mirrors NetworkProfile._dnsmasq(): anything other than strict true is OFF.
+            desired="false"
+            off=$((off + 1))
+        fi
+
+        prefix="${uuid:0:13}"
+
+        for member in \
+            "c_net_${prefix}_set" \
+            "c_net_${prefix}_set6" \
+            "c_net_ll6_${prefix}_set6"
+        do
+            # list:set cannot contain a child set that does not exist yet.
+            if ! ipset list "$member" >/dev/null 2>&1; then
+                missing=$((missing + 1))
+                continue
+            fi
+
+            if [[ "$desired" == "false" ]]; then
+                if ipset test no_dns_caching_set "$member" >/dev/null 2>&1; then
+                    already=$((already + 1))
+                else
+                    ipset -exist add no_dns_caching_set "$member"
+                    added=$((added + 1))
+                fi
+            else
+                if ipset test no_dns_caching_set "$member" >/dev/null 2>&1; then
+                    ipset -exist del no_dns_caching_set "$member"
+                    removed=$((removed + 1))
+                else
+                    already=$((already + 1))
+                fi
+            fi
+        done
+    done < <($REDIS --scan --pattern 'network:uuid:*')
+
+    echo "Networks"
+    echo "  LAN networks:               $total"
+    echo "  Explicitly OFF:             $off"
+    echo "  Explicitly ON:              $on"
+    echo "  Unset (default ON):         $unset"
+    echo "  Invalid policy JSON:        $invalid"
+    echo "  Added to live bypass set:   $added"
+    echo "  Removed from bypass set:    $removed"
+    echo "  Already correct:            $already"
+    echo "  Child ipsets not available: $missing"
+}
+
+reconcile_devices() {
+    local key mac raw desired
+    local total=0 off=0 on=0 unset=0 invalid=0
+    local added=0 removed=0 already=0
+
+    while IFS= read -r key; do
+        mac="${key#host:mac:}"
+
+        [[ "$mac" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
+
+        total=$((total + 1))
+        raw=$($REDIS --raw HGET "policy:mac:$mac" dnsmasq)
+
+        if [[ -z "$raw" ]]; then
+            # No device-level dnsmasq policy means Firewalla default: Booster ON.
+            desired="true"
+            unset=$((unset + 1))
+        elif ! jq -e . >/dev/null 2>&1 <<<"$raw"; then
+            echo "WARNING: $mac has invalid device dnsmasq JSON; skipped: $raw" >&2
+            invalid=$((invalid + 1))
+            continue
+        elif [[ "$(jq -r '.dnsCaching == true' <<<"$raw")" == "true" ]]; then
+            desired="true"
+            on=$((on + 1))
+        else
+            # Mirrors Host._dnsmasq(): anything other than strict true is OFF.
+            desired="false"
+            off=$((off + 1))
+        fi
+
+        if [[ "$desired" == "false" ]]; then
+            if ipset test no_dns_caching_mac_set "$mac" >/dev/null 2>&1; then
+                already=$((already + 1))
+            else
+                ipset -exist add no_dns_caching_mac_set "$mac"
+                added=$((added + 1))
+            fi
+        else
+            if ipset test no_dns_caching_mac_set "$mac" >/dev/null 2>&1; then
+                ipset -exist del no_dns_caching_mac_set "$mac"
+                removed=$((removed + 1))
+            else
+                already=$((already + 1))
+            fi
+        fi
+    done < <($REDIS --scan --pattern 'host:mac:*')
+
+    echo "Devices"
+    echo "  Known devices:              $total"
+    echo "  Explicitly OFF / unchecked: $off"
+    echo "  Explicitly ON / checked:    $on"
+    echo "  Unset (default ON):         $unset"
+    echo "  Invalid policy JSON:        $invalid"
+    echo "  Added to live bypass set:   $added"
+    echo "  Removed from bypass set:    $removed"
+    echo "  Already correct:            $already"
+}
+
+reconcile_runtime() {
+    echo "===== DNS BOOSTER RUNTIME RECONCILE ====="
+    echo "Reading persistent Firewalla Redis policy; no policy values will be changed."
+    echo
+
+    wait_for_runtime || return 1
+
+    reconcile_networks
+    echo
+    reconcile_devices
+    echo
+    echo "Runtime DNS Booster ipsets now match persistent policy."
+}
+
 network_status_one() {
     local intf="$1"
     local key uuid subnet raw state prefix active
@@ -381,6 +547,10 @@ case "$cmd" in
         fi
 
         status_devices
+        ;;
+
+    reconcile)
+        reconcile_runtime
         ;;
 
     net-off)
